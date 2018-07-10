@@ -1,5 +1,8 @@
 import torch
+from collections import OrderedDict
+from torch.autograd import Variable
 import itertools
+import util.util as util
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
@@ -9,80 +12,95 @@ class CycleGANModel(BaseModel):
     def name(self):
         return 'CycleGANModel'
 
-    @staticmethod
-    def modify_commandline_options(parser, is_train=True):
-        # default CycleGAN did not use dropout
-        parser.set_defaults(no_dropout=True)
-        if is_train:
-            parser.add_argument('--lambda_A', type=float, default=10.0, help='weight for cycle loss (A -> B -> A)')
-            parser.add_argument('--lambda_B', type=float, default=10.0,
-                                help='weight for cycle loss (B -> A -> B)')
-            parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
-
-        return parser
-
     def initialize(self, opt):
         BaseModel.initialize(self, opt)
-
-        # specify the training losses you want to print out. The program will call base_model.get_current_losses
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
-        # specify the images you want to save/display. The program will call base_model.get_current_visuals
-        visual_names_A = ['real_A', 'fake_B', 'rec_A']
-        visual_names_B = ['real_B', 'fake_A', 'rec_B']
-        if self.isTrain and self.opt.lambda_identity > 0.0:
-            visual_names_A.append('idt_A')
-            visual_names_B.append('idt_B')
-
-        self.visual_names = visual_names_A + visual_names_B
-        # specify the models you want to save to the disk. The program will call base_model.save_networks and base_model.load_networks
-        if self.isTrain:
-            self.model_names = ['G_A', 'G_B', 'D_A', 'D_B']
-        else:  # during test time, only load Gs
-            self.model_names = ['G_A', 'G_B']
-
         # load/define networks
         # The naming conversion is different from those used in the paper
         # Code (paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
+
         self.netG_A = networks.define_G(opt.input_nc, opt.output_nc,
-                                        opt.ngf, opt.which_model_netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                        opt.ngf, opt.which_model_netG, opt.norm, not opt.no_dropout, opt.init_type, self.gpu_ids)
         self.netG_B = networks.define_G(opt.output_nc, opt.input_nc,
-                                        opt.ngf, opt.which_model_netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                        opt.ngf, opt.which_model_netG, opt.norm, not opt.no_dropout, opt.init_type, self.gpu_ids)
 
         if self.isTrain:
             use_sigmoid = opt.no_lsgan
-            self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.which_model_netD,
-                                            opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
-            self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.which_model_netD,
-                                            opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
+            self.netD_A = networks.define_D(opt.output_nc, opt.ndf,
+                                            opt.which_model_netD,
+                                            opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, self.gpu_ids)
+            self.netD_B = networks.define_D(opt.input_nc, opt.ndf,
+                                            opt.which_model_netD,
+                                            opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, self.gpu_ids)
+        if not self.isTrain or opt.continue_train:
+            which_epoch = opt.which_epoch
+            self.load_network(self.netG_A, 'G_A', which_epoch)
+            self.load_network(self.netG_B, 'G_B', which_epoch)
+            if self.isTrain:
+                self.load_network(self.netD_A, 'D_A', which_epoch)
+                self.load_network(self.netD_B, 'D_B', which_epoch)
 
         if self.isTrain:
             self.fake_A_pool = ImagePool(opt.pool_size)
             self.fake_B_pool = ImagePool(opt.pool_size)
             # define loss functions
-            self.criterionGAN = networks.GANLoss(use_lsgan=not opt.no_lsgan).to(self.device)
+            self.criterionGAN = networks.GANLoss(use_lsgan=not opt.no_lsgan, tensor=self.Tensor)
             self.criterionCycle = torch.nn.L1Loss()
             self.criterionIdt = torch.nn.L1Loss()
+            self.criterionLog = networks.LogLoss()
+            self.criterionFeat = networks.VggLoss()
             # initialize optimizers
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()),
                                                 lr=opt.lr, betas=(opt.beta1, 0.999))
-            self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()),
-                                                lr=opt.lr, betas=(opt.beta1, 0.999))
+            self.optimizer_D_A = torch.optim.Adam(self.netD_A.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+            self.optimizer_D_B = torch.optim.Adam(self.netD_B.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizers = []
+            self.schedulers = []
             self.optimizers.append(self.optimizer_G)
-            self.optimizers.append(self.optimizer_D)
+            self.optimizers.append(self.optimizer_D_A)
+            self.optimizers.append(self.optimizer_D_B)
+            for optimizer in self.optimizers:
+                self.schedulers.append(networks.get_scheduler(optimizer, opt))
+
+        print('---------- Networks initialized -------------')
+        networks.print_network(self.netG_A)
+        networks.print_network(self.netG_B)
+        if self.isTrain:
+            networks.print_network(self.netD_A)
+            networks.print_network(self.netD_B)
+        print('-----------------------------------------------')
 
     def set_input(self, input):
         AtoB = self.opt.which_direction == 'AtoB'
-        self.real_A = input['A' if AtoB else 'B'].to(self.device)
-        self.real_B = input['B' if AtoB else 'A'].to(self.device)
+        input_A = input['A' if AtoB else 'B']
+        input_B = input['B' if AtoB else 'A']
+        if len(self.gpu_ids) > 0:
+            input_A = input_A.cuda(self.gpu_ids[0], async=True)
+            input_B = input_B.cuda(self.gpu_ids[0], async=True)
+        self.input_A = input_A
+        self.input_B = input_B
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
     def forward(self):
-        self.fake_B = self.netG_A(self.real_A)
-        self.rec_A = self.netG_B(self.fake_B)
+        self.real_A = Variable(self.input_A)
+        self.real_B = Variable(self.input_B)
 
-        self.fake_A = self.netG_B(self.real_B)
-        self.rec_B = self.netG_A(self.fake_A)
+    def test(self):
+        real_A = Variable(self.input_A, volatile=True)
+        fake_B = self.netG_A(real_A)
+        rec_A = self.netG_B(fake_B)
+        # self.rec_A = rec_A.data
+        self.rec_A = self.netG_B(fake_B).data
+        self.fake_B = fake_B.data
+
+        real_B = Variable(self.input_B, volatile=True)
+        fake_A = self.netG_B(real_B)
+        # rec_B = self.netG_A(fake_A).data
+        self.rec_B = self.netG_A(fake_A).data
+        self.fake_A = fake_A.data
+
+    # get image paths
+    def get_image_paths(self):
+        return self.image_paths
 
     def backward_D_basic(self, netD, real, fake):
         # Real
@@ -99,11 +117,13 @@ class CycleGANModel(BaseModel):
 
     def backward_D_A(self):
         fake_B = self.fake_B_pool.query(self.fake_B)
-        self.loss_D_A = self.backward_D_basic(self.netD_A, self.real_B, fake_B)
+        loss_D_A = self.backward_D_basic(self.netD_A, self.real_B, fake_B)
+        self.loss_D_A = loss_D_A.data[0]
 
     def backward_D_B(self):
         fake_A = self.fake_A_pool.query(self.fake_A)
-        self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
+        loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
+        self.loss_D_B = loss_D_B.data[0]
 
     def backward_G(self):
         lambda_idt = self.opt.lambda_identity
@@ -112,38 +132,102 @@ class CycleGANModel(BaseModel):
         # Identity loss
         if lambda_idt > 0:
             # G_A should be identity if real_B is fed.
-            self.idt_A = self.netG_A(self.real_B)
-            self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_idt
+            idt_A = self.netG_A(self.real_B)
+            loss_idt_A = self.criterionIdt(idt_A, self.real_B) * lambda_B * lambda_idt
             # G_B should be identity if real_A is fed.
-            self.idt_B = self.netG_B(self.real_A)
-            self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_idt
+            idt_B = self.netG_B(self.real_A)
+            loss_idt_B = self.criterionIdt(idt_B, self.real_A) * lambda_A * lambda_idt
+
+            self.idt_A = idt_A.data
+            self.idt_B = idt_B.data
+            self.loss_idt_A = loss_idt_A.data[0]
+            self.loss_idt_B = loss_idt_B.data[0]
         else:
+            loss_idt_A = 0
+            loss_idt_B = 0
             self.loss_idt_A = 0
             self.loss_idt_B = 0
 
         # GAN loss D_A(G_A(A))
-        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
+        fake_B = self.netG_A(self.real_A)
+        pred_fake = self.netD_A(fake_B)
+        loss_G_A = self.criterionGAN(pred_fake, True)
+
         # GAN loss D_B(G_B(B))
-        self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
+        fake_A = self.netG_B(self.real_B)
+        pred_fake = self.netD_B(fake_A)
+        loss_G_B = self.criterionGAN(pred_fake, True)
+
         # Forward cycle loss
-        self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
+        rec_A = self.netG_B(fake_B)
+        loss_cycle_A = self.criterionCycle(rec_A, self.real_A) * lambda_A
+        loss_log_A = self.criterionLog(rec_A, self.real_A)
+        loss_feat_A = self.criterionFeat(rec_A, self.real_A)
+
         # Backward cycle loss
-        self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+        rec_B = self.netG_A(fake_A)
+        loss_cycle_B = self.criterionCycle(rec_B, self.real_B) * lambda_B
+        loss_log_B = self.criterionLog(rec_B, self.real_B)
+        loss_feat_B = self.criterionFeat(rec_B, self.real_B)
+
         # combined loss
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
-        self.loss_G.backward()
+        loss_G = loss_G_A + loss_G_B + loss_cycle_A + loss_cycle_B + loss_idt_A + loss_idt_B + loss_log_A + loss_feat_A + loss_log_B + loss_feat_B
+        loss_G.backward()
+
+        self.fake_B = fake_B.data
+        self.fake_A = fake_A.data
+        self.rec_A = rec_A.data
+        self.rec_B = rec_B.data
+
+        self.loss_G_A = loss_G_A.data[0]
+        self.loss_G_B = loss_G_B.data[0]
+        self.loss_cycle_A = loss_cycle_A.data[0]
+        self.loss_cycle_B = loss_cycle_B.data[0]
+        self.loss_log_A = loss_log_A.data[0]
+        self.loss_log_B = loss_log_B.data[0]
+        self.loss_feat_A = loss_feat_A.data[0]
+        self.loss_feat_B = loss_feat_B.data[0]
 
     def optimize_parameters(self):
         # forward
         self.forward()
         # G_A and G_B
-        self.set_requires_grad([self.netD_A, self.netD_B], False)
         self.optimizer_G.zero_grad()
         self.backward_G()
         self.optimizer_G.step()
-        # D_A and D_B
-        self.set_requires_grad([self.netD_A, self.netD_B], True)
-        self.optimizer_D.zero_grad()
+        # D_A
+        self.optimizer_D_A.zero_grad()
         self.backward_D_A()
+        self.optimizer_D_A.step()
+        # D_B
+        self.optimizer_D_B.zero_grad()
         self.backward_D_B()
-        self.optimizer_D.step()
+        self.optimizer_D_B.step()
+
+    def get_current_errors(self):
+        ret_errors = OrderedDict([('D_A', self.loss_D_A), ('G_A', self.loss_G_A), ('Cyc_A', self.loss_cycle_A), ('Log_A', self.loss_log_A), ('Feat_A', self.loss_feat_A),
+                                  ('D_B', self.loss_D_B), ('G_B', self.loss_G_B), ('Cyc_B', self.loss_cycle_B), ('Log_B', self.loss_log_B), ('Feat_B', self.loss_feat_B)])
+        if self.opt.lambda_identity > 0.0:
+            ret_errors['idt_A'] = self.loss_idt_A
+            ret_errors['idt_B'] = self.loss_idt_B
+        return ret_errors
+
+    def get_current_visuals(self):
+        real_A = util.tensor2im(self.input_A)
+        fake_B = util.tensor2im(self.fake_B)
+        rec_A = util.tensor2im(self.rec_A)
+        real_B = util.tensor2im(self.input_B)
+        fake_A = util.tensor2im(self.fake_A)
+        rec_B = util.tensor2im(self.rec_B)
+        ret_visuals = OrderedDict([('real_A', real_A), ('fake_B', fake_B), ('rec_A', rec_A),
+                                   ('real_B', real_B), ('fake_A', fake_A), ('rec_B', rec_B)])
+        if self.opt.isTrain and self.opt.lambda_identity > 0.0:
+            ret_visuals['idt_A'] = util.tensor2im(self.idt_A)
+            ret_visuals['idt_B'] = util.tensor2im(self.idt_B)
+        return ret_visuals
+
+    def save(self, label):
+        self.save_network(self.netG_A, 'G_A', label, self.gpu_ids)
+        self.save_network(self.netD_A, 'D_A', label, self.gpu_ids)
+        self.save_network(self.netG_B, 'G_B', label, self.gpu_ids)
+        self.save_network(self.netD_B, 'D_B', label, self.gpu_ids)
